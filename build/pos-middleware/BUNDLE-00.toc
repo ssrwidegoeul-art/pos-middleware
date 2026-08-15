@@ -1,0 +1,3 @@
+([('pos-middleware',
+   '/Users/sinseunglyong/pos-middleware/dist/pos-middleware',
+   'EXECUTABLE')],)
