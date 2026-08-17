@@ -1,0 +1,8 @@
+# 빌드 산출물
+__pycache__/
+build/
+dist/
+
+# 임시 검증 스크립트
+_verify_pipeline.py
+_verify_wait.py
