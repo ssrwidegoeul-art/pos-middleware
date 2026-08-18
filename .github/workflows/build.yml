@@ -7,25 +7,32 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    
+
     steps:
     - uses: actions/checkout@v3
-    
+
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.10'
-    
+
     - name: Install dependencies
-      run: |
-        pip install -r requirements.txt
-        pip install pyinstaller
-    
+      run: pip install -r requirements.txt
+
     - name: Build EXE
-      run: pyinstaller --onefile --name pos-middleware --windowed main.py
-    
+      run: pyinstaller --onefile --name pos-middleware main.py
+
+    - name: Package (exe + config.json + 설치방법.txt)
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force dist\package | Out-Null
+        Copy-Item dist\pos-middleware.exe dist\package\
+        Copy-Item config.json dist\package\
+        Copy-Item "설치방법.txt" dist\package\
+        Compress-Archive -Path dist\package\* -DestinationPath dist\pos-middleware-package.zip -Force
+
     - name: Upload artifact
       uses: actions/upload-artifact@v3
       with:
-        name: pos-middleware
-        path: dist/pos-middleware.exe
+        name: pos-middleware-package
+        path: dist/pos-middleware-package.zip

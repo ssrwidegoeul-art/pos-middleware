@@ -3,6 +3,10 @@ __pycache__/
 build/
 dist/
 
+# 런타임 산출물
+log.txt
+output/
+
 # 임시 검증 스크립트
 _verify_pipeline.py
 _verify_wait.py

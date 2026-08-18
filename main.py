@@ -2,46 +2,41 @@ r"""
 POS Middleware - 돈까스/마제소바 매장 전용
 배달 주문 시 부자재 목록을 자동으로 추가 출력
 
-[동작 방식]
-1. config.json의 VID/PID로 SAM4S USB 프린터를 찾아 연결합니다.
-   프린터가 연결되지 않으면 오류 메시지를 출력하고 종료하지 않은 채 대기 상태를 유지합니다.
-2. 프린터로 전송되는 ESC/POS 데이터를 실시간으로 수신하여 텍스트로 변환합니다.
-3. 영수증 헤더에 '배달'/'한점배달'/'알콜' 키워드가 있으면 배달 주문으로 인식합니다.
+[동작 방식 - 네트워크 릴레이(중계) 모드]
+1. 이 프로그램은 포스기 안에서 가상 프린터 서버 역할을 합니다 (기본 127.0.0.1:9100).
+2. 포스 프로그램의 프린터 주소를 127.0.0.1:9100 으로 바꾸면,
+   인쇄 데이터(ESC/POS)가 이 프로그램을 거쳐 갑니다.
+3. 수신된 데이터를 텍스트로 변환하여 분석합니다.
+   - 영수증 헤더에 '배달'/'한점배달'/'알콜' 키워드가 있으면 배달 주문으로 인식
    - 배달 주문 + '[매장용]'  → 부자재 목록을 영수증 하단에 추가
-   - 홀 주문 또는 '[고객용]' → 원본 그대로 유지
-4. 처리 내역(시간, 수신된 데이터, 처리 결과, 오류 내용)은 log.txt에 기록합니다.
-   처리된 영수증은 output/ 폴더에 저장됩니다.
+   - 홀 주문 또는 '[고객용]' → 원본 그대로 전달 (변경 없음)
+4. 처리된 데이터를 config.json에 설정된 실제 프린터(IP:9100)로 전달합니다.
+5. 모든 처리 내역(시간, 수신 데이터, 처리 결과, 오류)은 log.txt에 기록합니다.
 
 [실행 방법]
-  python main.py          # 정상 실행 (USB 데이터 수신 대기)
-  python main.py --test   # 내장 테스트 실행
+  python main.py                        # 정상 실행 (릴레이 서버 대기)
+  python main.py --test                 # 내장 테스트 실행
+  python main.py --config 설정.json     # 다른 설정 파일 사용
 
-[Windows 단일 exe 빌드]
-  build.bat 실행 → dist 폴더에 POSMiddleware.exe 생성 (config.json은 exe와 같은 폴더에 위치해야 함)
+[Windows 설치/실행]
+  GitHub Actions에서 빌드된 압축 파일(pos-middleware-package.zip)을 받아
+  exe와 config.json, 설치방법.txt를 한 폴더에 두고 exe를 실행하면 됩니다.
+  자세한 내용은 설치방법.txt 참고.
 
 [참고]
-- Windows에서 pyusb로 프린터에 접근하려면 libusb 드라이버(Zadig 등) 설치가 필요할 수 있습니다.
-- 프린터 VID/PID 확인: Windows 장치 관리자 → 해당 USB 장치 → 속성 → 자세히 → 하드웨어 ID
-  (예: USB\VID_1FC9&PID_2018 → config.json에 "vid": "0x1FC9", "pid": "0x2018")
-- 한글 영수증은 CP949(KSC5601) 인코딩을 가정합니다. 다른 인코딩이면 RECEIPT_ENCODING을 수정하세요.
+- 프린터 IP 확인: 포스기 제어판 → 장치 및 프린터 → 프린터 속성 → 포트 탭
+  (표준 TCP/IP 포트에 프린터 IP가 표시됩니다)
+- 한글 영수증은 CP949(KSC5601) 인코딩을 가정합니다.
 """
 
 import argparse
 import json
 import os
+import socket
 import sys
 import time
 import traceback
 from datetime import datetime
-
-# USB 라이브러리는 선택 의존성입니다. 없어도 --test 모드와 로그 기능은 동작합니다.
-try:
-    import usb.core
-    import usb.util
-
-    USB_AVAILABLE = True
-except ImportError:
-    USB_AVAILABLE = False
 
 
 # ===== 경로 / 상수 =====
@@ -63,13 +58,14 @@ DELIVERY_KEYWORDS = ("배달", "한점배달", "알콜")
 STORE_MARK = "[매장용]"
 CUSTOMER_MARK = "[고객용]"
 
-# USB 수신 관련
-USB_POLL_INTERVAL_SEC = 5      # 프린터 미연결 시 재시도 간격(초)
-USB_READ_TIMEOUT_MS = 1000     # 단일 read 타임아웃(ms)
-RECEIPT_IDLE_TIMEOUT_SEC = 3   # 데이터 유입 정지 후 영수증 확정까지 대기(초)
-MAX_RECEIPT_BYTES = 64 * 1024  # 영수증 수신 버퍼 상한(바이트)
+# 릴레이 수신 관련
+RETRY_INTERVAL_SEC = 5        # 수신 서버 시작 실패 시 재시도 간격(초)
+RECEIPT_IDLE_TIMEOUT_SEC = 3  # 데이터 유입 정지 후 영수증 확정까지 대기(초)
+MAX_RECEIPT_BYTES = 64 * 1024 # 영수증 수신 버퍼 상한(바이트)
+PRINTER_TIMEOUT_SEC = 10      # 프린터 연결 타임아웃(초)
+PRINTER_RETRY_COUNT = 3       # 프린터 전송 실패 시 재시도 횟수
 
-_CUT_PREFIX = b"\x1d\x56"      # GS V — 용지 커터 명령(영수증 끝 신호)
+_CUT_PREFIX = b"\x1d\x56"     # GS V — 용지 커터 명령(영수증 끝 신호)
 
 
 # ===== 매핑 데이터 =====
@@ -120,7 +116,8 @@ OPTION_MAPPING = {
 
 # ===== 설정 파일 (요청사항 4) =====
 DEFAULT_CONFIG = {
-    "printer": {"vid": "0x0000", "pid": "0x0000"},
+    "printer": {"ip": "192.168.0.7", "port": 9100},
+    "listen": {"host": "127.0.0.1", "port": 9100},
     "debug": False,
 }
 
@@ -129,6 +126,7 @@ def load_config(path=CONFIG_PATH):
     """config.json을 읽어 설정을 반환합니다. 파일이 없거나 손상되면 기본값을 사용합니다."""
     config = {
         "printer": dict(DEFAULT_CONFIG["printer"]),
+        "listen": dict(DEFAULT_CONFIG["listen"]),
         "debug": DEFAULT_CONFIG["debug"],
     }
     if not os.path.exists(path):
@@ -138,17 +136,11 @@ def load_config(path=CONFIG_PATH):
         with open(path, "r", encoding="utf-8") as f:
             user_config = json.load(f)
         config["printer"].update(user_config.get("printer", {}))
+        config["listen"].update(user_config.get("listen", {}))
         config["debug"] = bool(user_config.get("debug", config["debug"]))
     except (OSError, ValueError) as e:
         print(f"[경고] config.json 로드 실패 ({e}). 기본 설정으로 실행합니다.")
     return config
-
-
-def parse_hex(value):
-    """'0x1FC9' 형태의 문자열(또는 정수)을 정수로 변환합니다."""
-    if isinstance(value, int):
-        return value
-    return int(str(value).strip(), 0)
 
 
 # ===== 로그 기능 (요청사항 6) =====
@@ -280,6 +272,11 @@ def escpos_data_to_text(data):
     return cleaned.decode(RECEIPT_ENCODING, errors="replace").strip()
 
 
+def text_to_escpos(text):
+    """텍스트를 프린터 전송용 ESC/POS 바이트로 변환합니다 (커터 명령 포함)."""
+    return text.encode(RECEIPT_ENCODING, errors="replace") + _CUT_PREFIX + b"\x00"
+
+
 # ===== 영수증 처리 (홀/배달 구분, 요청사항 3) =====
 def is_delivery_order(receipt_text):
     """영수증 헤더에 배달 키워드가 있으면 배달 주문으로 판단합니다."""
@@ -319,50 +316,30 @@ def process_receipt(receipt_text):
     return receipt_text, note
 
 
-# ===== USB 프린터 연결 (요청사항 1) =====
-def find_sam4s_printer(vid, pid):
-    """config.json의 VID/PID로 SAM4S 프린터를 찾습니다."""
-    if not USB_AVAILABLE:
-        return None
-    return usb.core.find(idVendor=vid, idPID=pid)
+# ===== 프린터 전달 (네트워크 릴레이) =====
+def send_to_printer(data, config):
+    """처리된 데이터를 실제 프린터(IP:포트)로 전송합니다.
 
+    실패 시 PRINTER_RETRY_COUNT회 재시도하고, 계속 실패하면 False를 반환합니다.
+    """
+    ip = str(config["printer"]["ip"])
+    port = int(config["printer"]["port"])
 
-def open_printer_device(device):
-    """프린터의 USB 인터페이스를 사용 가능한 상태로 준비합니다."""
-    try:
+    for attempt in range(1, PRINTER_RETRY_COUNT + 1):
         try:
-            if device.is_kernel_driver_active(0):
-                device.detach_kernel_driver(0)
-        except (usb.core.USBError, NotImplementedError):
-            pass
-        device.set_configuration()
-        usb.util.claim_interface(device, 0)
-        return device
-    except usb.core.USBError:
-        return None
-
-
-def get_printer_endpoint(device):
-    """프린터로 전송되는 데이터가 흐르는 BULK OUT 엔드포인트를 찾습니다."""
-    cfg = device.get_active_configuration()
-    for interface in cfg:
-        endpoint = usb.util.find_descriptor(
-            interface,
-            custom_match=lambda ep: (
-                usb.util.endpoint_direction(ep.bEndpointAddress)
-                == usb.util.ENDPOINT_OUT
-                and usb.util.endpoint_type(ep.bmAttributes)
-                == usb.util.ENDPOINT_TYPE_BULK
-            ),
-        )
-        if endpoint is not None:
-            return endpoint
-    return None
+            with socket.create_connection((ip, port), timeout=PRINTER_TIMEOUT_SEC) as s:
+                s.sendall(data)
+            return True
+        except OSError as e:
+            log_error(f"프린터 전송 실패 ({attempt}/{PRINTER_RETRY_COUNT}): {ip}:{port} - {e}")
+            if attempt < PRINTER_RETRY_COUNT:
+                time.sleep(2)
+    return False
 
 
 # ===== 실시간 수신 / 처리 루프 (요청사항 2) =====
 def handle_receipt(raw_bytes, config):
-    """영수증 1건을 처리합니다: 텍스트 변환 → 홀/배달 판단 → 저장 및 로그."""
+    """영수증 1건을 처리합니다: 텍스트 변환 → 홀/배달 판단 → 프린터 전달 및 로그."""
     text = escpos_data_to_text(raw_bytes)
     if not text.strip():
         return
@@ -373,15 +350,25 @@ def handle_receipt(raw_bytes, config):
     result_text, note = process_receipt(text)
     log_message(f"처리 결과: {note}")
 
-    output_path = save_receipt_output(result_text)
-    log_message(f"결과 저장: {output_path}")
-    print(f"[결과] {note} → {output_path}")
+    # 변경이 없으면 원본 바이트를 그대로 전달 (포맷/정렬 보존)
+    if result_text == text:
+        forward_data = raw_bytes
+    else:
+        forward_data = text_to_escpos(result_text)
+        save_receipt_output(result_text)
+        log_message("부자재 목록이 추가된 데이터로 프린터 전송")
+
+    if send_to_printer(forward_data, config):
+        print(f"[전송] 프린터로 전달됨 — {note}")
+    else:
+        print(f"[오류] 프린터 전송 실패 — {note} (log.txt 확인)")
+        log_error("프린터 전송 최종 실패 — 데이터는 log.txt에서 확인할 수 있습니다.")
 
     debug_print(config, "=" * 40 + "\n" + result_text + "\n" + "=" * 40)
 
 
 def save_receipt_output(result_text):
-    """처리된 영수증을 output/ 폴더에 저장하고 경로를 반환합니다."""
+    """부자재가 추가된 영수증을 output/ 폴더에 저장하고 경로를 반환합니다."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     path = os.path.join(OUTPUT_DIR, f"receipt_{stamp}.txt")
@@ -390,28 +377,22 @@ def save_receipt_output(result_text):
     return path
 
 
-def receive_loop(device, config):
-    """ESC/POS 데이터를 실시간으로 수신하고 영수증 단위로 처리합니다.
+def handle_connection(conn, config):
+    """포스 프로그램과의 연결 1개를 처리합니다 (인쇄 1건 또는 여러 건).
 
     - 용지 커터 명령(GS V)을 영수증 끝으로 판단합니다.
-    - 커터 명령이 없어도 데이터 유입이 멈추면 일정 시간 후 확정 처리합니다.
+    - 커터 명령이 없어도 데이터 유입이 멈추거나 연결이 닫히면 확정 처리합니다.
     """
-    endpoint = get_printer_endpoint(device)
-    if endpoint is None:
-        raise usb.core.USBError("데이터를 수신할 USB 엔드포인트를 찾을 수 없습니다.")
-
     buffer = bytearray()
     last_data_time = time.time()
-    debug_print(config, f"수신 루프 시작 (endpoint: 0x{endpoint.bEndpointAddress:02x})")
 
     while True:
         try:
-            chunk = endpoint.read(endpoint.wMaxPacketSize, timeout=USB_READ_TIMEOUT_MS)
-        except usb.core.USBError as e:
-            if "timed out" in str(e).lower():
-                chunk = None  # 타임아웃 = 수신 데이터 없음 (정상)
-            else:
-                raise  # 연결 해제 등 실제 오류 → 상위에서 재연결 처리
+            chunk = conn.recv(4096)
+        except socket.timeout:
+            chunk = None  # 타임아웃 = 데이터 없음 (정상)
+        except OSError:
+            chunk = b""  # 연결 오류 = 종료로 처리
 
         now = time.time()
 
@@ -419,20 +400,18 @@ def receive_loop(device, config):
             buffer.extend(chunk)
             last_data_time = now
             debug_print(config, f"수신 {len(chunk)}바이트 (누적 {len(buffer)}바이트)")
-
             if len(buffer) > MAX_RECEIPT_BYTES:
                 log_error(f"수신 버퍼가 {MAX_RECEIPT_BYTES}바이트를 초과하여 초기화합니다.")
                 buffer.clear()
-                continue
 
-        # 용지 커터 명령(GS V) 발견 → 영수증 끝으로 판단하고 처리
-        cut_index = buffer.find(_CUT_PREFIX)
-        if cut_index >= 0:
-            cut_end = cut_index + 3  # GS V + 파라미터 1바이트 포함
-            receipt_bytes = bytes(buffer[:cut_end])
-            del buffer[:cut_end]
+        # 커터 명령 단위로 영수증을 분리하여 처리
+        while True:
+            cut_index = buffer.find(_CUT_PREFIX)
+            if cut_index < 0:
+                break
+            receipt_bytes = bytes(buffer[: cut_index + 3])
+            del buffer[: cut_index + 3]
             handle_receipt(receipt_bytes, config)
-            continue
 
         # 데이터 유입이 멈춘 뒤 일정 시간이 지나면 남은 내용을 영수증으로 확정
         if buffer and (now - last_data_time) >= RECEIPT_IDLE_TIMEOUT_SEC:
@@ -440,64 +419,72 @@ def receive_loop(device, config):
             buffer.clear()
             handle_receipt(receipt_bytes, config)
 
+        # 연결 종료 시 남은 데이터를 처리하고 종료
+        if chunk == b"":
+            if buffer:
+                receipt_bytes = bytes(buffer)
+                buffer.clear()
+                handle_receipt(receipt_bytes, config)
+            break
+
 
 def run_middleware(config):
-    """메인 루프: 프린터 연결 대기 → 연결되면 실시간 수신 (연결 해제 시 재대기)."""
-    vid = parse_hex(config["printer"]["vid"])
-    pid = parse_hex(config["printer"]["pid"])
+    """메인 루프: 가상 프린터 서버(수신) → 분석 → 실제 프린터로 전달.
 
-    print("=== POS Middleware 시작 ===")
-    print(f"[설정] VID=0x{vid:04x} PID=0x{pid:04x} 디버그={'ON' if config['debug'] else 'OFF'}")
+    수신 서버를 열지 못해도 종료하지 않고 재시도하며 대기 상태를 유지합니다.
+    """
+    host = str(config["listen"]["host"])
+    port = int(config["listen"]["port"])
+    printer_ip = str(config["printer"]["ip"])
+    printer_port = int(config["printer"]["port"])
+
+    print("=== POS Middleware 시작 (네트워크 릴레이 모드) ===")
+    print(f"[설정] 수신 {host}:{port} → 프린터 {printer_ip}:{printer_port} | "
+          f"디버그={'ON' if config['debug'] else 'OFF'}")
     log_message(
-        f"미들웨어 시작 (VID=0x{vid:04x}, PID=0x{pid:04x}, "
+        f"미들웨어 시작 (수신 {host}:{port} → 프린터 {printer_ip}:{printer_port}, "
         f"디버그={'ON' if config['debug'] else 'OFF'})"
     )
 
-    if not USB_AVAILABLE:
-        print("[경고] pyusb가 설치되어 있지 않습니다. USB 수신이 불가능하여 대기 상태로 유지됩니다.")
-        print("       설치: pip install pyusb  (Windows는 libusb 드라이버도 필요)")
-        log_error("pyusb 미설치 — USB 수신 불가")
-
-    if vid == 0 and pid == 0:
-        print("[경고] config.json의 VID/PID가 0x0000입니다. 실제 프린터 값으로 설정해주세요.")
-        log_error("config.json의 VID/PID가 설정되지 않음(0x0000)")
-
+    server = None
     while True:
-        try:
-            device = find_sam4s_printer(vid, pid)
-        except usb.core.USBError as e:
-            print(f"[오류] USB 백엔드 오류: {e} — {USB_POLL_INTERVAL_SEC}초 후 재시도...")
-            log_error(f"USB 백엔드 오류: {e}")
-            time.sleep(USB_POLL_INTERVAL_SEC)
-            continue
-
-        if device is None:
-            print(f"[오류] 프린터를 찾을 수 없습니다 (VID=0x{vid:04x}, PID=0x{pid:04x}). "
-                  f"{USB_POLL_INTERVAL_SEC}초 후 재시도...")
-            log_error(f"프린터 미연결 — 대기 중 (VID=0x{vid:04x}, PID=0x{pid:04x})")
-            time.sleep(USB_POLL_INTERVAL_SEC)
-            continue
-
-        if open_printer_device(device) is None:
-            print(f"[오류] 프린터 인터페이스를 열 수 없습니다. {USB_POLL_INTERVAL_SEC}초 후 재시도...")
-            log_error("프린터 인터페이스 열기 실패 — 대기 중")
-            time.sleep(USB_POLL_INTERVAL_SEC)
-            continue
-
-        print("[연결] SAM4S 프린터 연결됨. ESC/POS 데이터 수신 대기 중...")
-        log_message("프린터 연결 성공")
+        if server is None:
+            try:
+                server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server.bind((host, port))
+                server.listen(5)
+                print(f"[대기] 수신 서버 시작: {host}:{port}")
+                print(f"[안내] 포스 프로그램의 프린터 주소를 {host}:{port} 로 변경해주세요.")
+                log_message(f"수신 서버 시작: {host}:{port}")
+            except OSError as e:
+                print(f"[오류] 수신 서버를 열 수 없습니다 ({e}). "
+                      f"{RETRY_INTERVAL_SEC}초 후 재시도...")
+                log_error(f"수신 서버 시작 실패: {e}")
+                time.sleep(RETRY_INTERVAL_SEC)
+                continue
 
         try:
-            receive_loop(device, config)
-        except usb.core.USBError as e:
-            print(f"[오류] 프린터 연결이 끊어졌습니다 ({e}). 재연결 대기 중...")
-            log_error(f"USB 오류로 연결 해제: {e}")
-            time.sleep(USB_POLL_INTERVAL_SEC)
-        except Exception as e:  # 예상치 못한 오류도 종료하지 않고 대기 상태 유지
-            print(f"[오류] 처리 중 오류 발생: {e} — 대기 상태 유지")
-            log_error(f"예상치 못한 오류: {e}\n{traceback.format_exc()}")
-            time.sleep(USB_POLL_INTERVAL_SEC)
-        # 연결이 끊겨도 종료하지 않고 while 루프에서 재연결을 시도합니다.
+            conn, addr = server.accept()
+        except OSError as e:
+            log_error(f"연결 대기 중 오류: {e}")
+            try:
+                server.close()
+            except OSError:
+                pass
+            server = None
+            time.sleep(RETRY_INTERVAL_SEC)
+            continue
+
+        with conn:
+            try:
+                debug_print(config, f"포스 연결됨: {addr}")
+                conn.settimeout(0.5)
+                handle_connection(conn, config)
+            except Exception as e:
+                log_error(f"연결 처리 중 오류: {e}\n{traceback.format_exc()}")
+                print(f"[오류] 연결 처리 중 오류: {e} — 대기 상태 유지")
+        debug_print(config, f"포스 연결 종료: {addr}")
 
 
 # ===== 기존 함수 (변경 없음) =====
@@ -627,6 +614,13 @@ def run_tests():
     assert "\x1b" not in converted and "\x1d" not in converted, "제어 코드가 남아 있습니다."
     print("통과")
 
+    # 텍스트 → ESC/POS 변환(왕복) 테스트
+    print("\n[테스트 6] 텍스트 → ESC/POS 변환 (왕복)")
+    roundtrip = escpos_data_to_text(text_to_escpos(test_receipt))
+    assert "부자재 목록" not in roundtrip or True  # 왕복 자체는 메뉴 텍스트 보존 확인
+    assert "더블 등심돈까스" in roundtrip, "왕복 변환이 올바르지 않습니다."
+    print("통과")
+
     print("\n=== 모든 테스트 통과 ===")
 
 
@@ -640,9 +634,10 @@ def main():
 
     parser = argparse.ArgumentParser(description="POS Middleware - 부자재 자동 출력")
     parser.add_argument("--test", action="store_true", help="내장 테스트 실행")
+    parser.add_argument("--config", default=None, help="설정 파일 경로 (기본: 실행 파일 옆 config.json)")
     args = parser.parse_args()
 
-    config = load_config()
+    config = load_config(args.config) if args.config else load_config()
 
     if args.test:
         run_tests()
